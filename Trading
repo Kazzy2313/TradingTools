@@ -1,1 +1,1135 @@
+Ok, du coup on a quasiment fini le projet, il reste un petit truc que j'aimerais bien, c'est du coup analyse individuelle, là le script que je vais t'envoyer du coup. Il faudrait que tu changes un truc, c'est tout, tu changes rien d'autre, c'est juste analyse individuelle. Analyse individuelle, liste prédéfinie tu peux laisser, la liste prédéfinie du coup ça peut être bien. Et tu vois la liste prédéfinie, en gros tu sais, tu as choisi une action et quand tu appuies dessus, tu as toutes les actions qui définissent. Et bien du coup, dès que tu appuies sur une action, ça te met le graphique etc. Ce qui serait bien, ce serait que dans Recherche Libre, ça fasse la même chose. Du coup, dans liste prédéfinie tu vois, tu as le nom des actions, Air Liquide, Clearing etc. Dans Recherche Libre, ce qui serait bien c'est que c'est toutes les actions, il y a pareil le truc qui défile, tu marques par exemple Clearing et tu as le graphique du truc directement. Sans le symbole etc, juste avec le nom de l'action. Donc voilà, tu peux essayer de faire ça et je te donne le script juste après. Script import re
+from typing import Optional
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
 
+# ---------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------
+st.set_page_config(page_title="Scanner Trading", layout="wide")
+st.title("📈 Scanner Trading")
+
+# ---------------------------------------------------------------------
+# LINE BREAK CALCUL SELON BOURSORAMA (FIXE)
+# ---------------------------------------------------------------------
+def calculate_boursorama_linebreak(close_prices, reversal=2):
+    """
+    Calcul LineBreak selon l'implémentation Boursorama
+    reversal=2 FIXE comme sur Boursorama
+    """
+    if len(close_prices) < reversal + 1:
+        return []
+    
+    bricks = []
+    # Première brique basée sur les deux premiers cours
+    bricks.append({
+        'type': 'green' if close_prices[1] > close_prices[0] else 'red',
+        'open': close_prices[0],
+        'close': close_prices[1],
+        'index': 1
+    })
+    
+    for i in range(2, len(close_prices)):
+        current_close = close_prices[i]
+        last_brick = bricks[-1]
+        
+        # RÈGLE BOURSORAMA : Vérifier d'abord les inversions
+        reversal_occurred = False
+        
+        if last_brick['type'] == 'green':
+            # Inversion si on casse le bas des 2 dernières briques vertes
+            if len(bricks) >= reversal:
+                recent_lows = [bricks[-j]['open'] for j in range(1, min(reversal, len(bricks)) + 1)]
+                min_recent_low = min(recent_lows)
+                if current_close < min_recent_low:
+                    bricks.append({
+                        'type': 'red',
+                        'open': last_brick['close'],
+                        'close': current_close,
+                        'index': i
+                    })
+                    reversal_occurred = True
+        
+        else:  # red brick
+            # Inversion si on casse le haut des 2 dernières briques rouges
+            if len(bricks) >= reversal:
+                recent_highs = [bricks[-j]['open'] for j in range(1, min(reversal, len(bricks)) + 1)]
+                max_recent_high = max(recent_highs)
+                if current_close > max_recent_high:
+                    bricks.append({
+                        'type': 'green',
+                        'open': last_brick['close'],
+                        'close': current_close,
+                        'index': i
+                    })
+                    reversal_occurred = True
+        
+        # Si pas d'inversion, continuer la tendance actuelle
+        if not reversal_occurred:
+            if last_brick['type'] == 'green':
+                if current_close > last_brick['close']:
+                    bricks.append({
+                        'type': 'green',
+                        'open': last_brick['close'],
+                        'close': current_close,
+                        'index': i
+                    })
+            else:  # red
+                if current_close < last_brick['close']:
+                    bricks.append({
+                        'type': 'red',
+                        'open': last_brick['close'],
+                        'close': current_close,
+                        'index': i
+                    })
+    
+    return bricks
+
+def get_clean_data(symbol, period="3mo"):
+    """Récupère des données propres avec actualisation complète"""
+    try:
+        # Télécharger les données avec une période qui garantit l'actualisation
+        df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False)
+        if df.empty:
+            return None
+        
+        # Nettoyage
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df = df.dropna()
+        
+        # CORRECTION : Ne pas ignorer le jour en cours pour avoir les données les plus récentes
+        # Vérifier si les données sont à jour
+        last_data_date = df.index[-1].date()
+        today = datetime.now().date()
+        
+        # Si les données ont plus d'1 jour de retard, essayer de forcer l'actualisation
+        if (today - last_data_date).days > 1:
+            # Télécharger avec une période différente pour forcer l'actualisation
+            df_fresh = yf.download(symbol, period="1mo", interval="1d", auto_adjust=True, progress=False)
+            if not df_fresh.empty:
+                df_fresh = df_fresh[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+                df_fresh.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                df_fresh = df_fresh.dropna()
+                if len(df_fresh) > 0:
+                    df = df_fresh
+        
+        return df
+    except Exception as e:
+        st.error(f"Erreur lors du téléchargement des données pour {symbol}: {str(e)}")
+        return None
+
+def detect_boursorama_signal(df):
+    """Détecte les signaux selon Boursorama avec reversal=2 FIXE"""
+    if df is None or len(df) < 10:
+        return False, []
+    
+    close_prices = df['Close'].values
+    bricks = calculate_boursorama_linebreak(close_prices, reversal=2)
+    
+    if len(bricks) < 2:
+        return False, bricks
+    
+    last_two = bricks[-2:]
+    signal_detected = (
+        (last_two[0]['type'] == 'red' and last_two[1]['type'] == 'green') or
+        (last_two[0]['type'] == 'green' and last_two[1]['type'] == 'red')
+    )
+    
+    return signal_detected, bricks
+
+# ---------------------------------------------------------------------
+# CALCUL MACD
+# ---------------------------------------------------------------------
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    """Calcule le MACD"""
+    df = df.copy()
+    
+    # EMA rapide et lente
+    df['EMA_fast'] = df['Close'].ewm(span=fast).mean()
+    df['EMA_slow'] = df['Close'].ewm(span=slow).mean()
+    
+    # MACD et ligne de signal
+    df['MACD'] = df['EMA_fast'] - df['EMA_slow']
+    df['MACD_signal'] = df['MACD'].ewm(span=signal).mean()
+    df['MACD_histogram'] = df['MACD'] - df['MACD_signal']
+    
+    return df
+
+# ---------------------------------------------------------------------
+# GRAPHIQUES AMÉLIORÉS AVEC MACD ET DATES
+# ---------------------------------------------------------------------
+def create_pro_chart(df, title, show_bollinger=True, show_ema=True, show_macd=True):
+    """Graphique trading professionnel avec MACD"""
+    # Calculer le MACD si demandé
+    if show_macd:
+        df = calculate_macd(df)
+    
+    if show_macd:
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            subplot_titles=(f"<b>{title}</b>", "<b>MACD</b>"),
+            row_heights=[0.7, 0.3]
+        )
+    else:
+        fig = make_subplots(rows=1, cols=1, subplot_titles=(f"<b>{title}</b>",))
+    
+    # Bougies
+    row = 1 if show_macd else 1
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'],
+        high=df['High'],
+        low=df['Low'],
+        close=df['Close'],
+        increasing_line_color='#00CC00',
+        decreasing_line_color='#FF0000',
+        name='Prix'
+    ), row=row, col=1)
+    
+    # Bollinger Bands
+    if show_bollinger and len(df) > 20:
+        df['SMA20'] = df['Close'].rolling(20).mean()
+        df['STD20'] = df['Close'].rolling(20).std()
+        df['BB_Upper'] = df['SMA20'] + (df['STD20'] * 2)
+        df['BB_Lower'] = df['SMA20'] - (df['STD20'] * 2)
+        
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['BB_Upper'],
+            line=dict(color='orange', width=1, dash='dash'),
+            name='Bollinger Upper'
+        ), row=row, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['BB_Lower'],
+            line=dict(color='orange', width=1, dash='dash'),
+            fill='tonexty',
+            fillcolor='rgba(255,165,0,0.1)',
+            name='Bollinger Lower'
+        ), row=row, col=1)
+    
+    # EMA 20
+    if show_ema and len(df) > 20:
+        df['EMA20'] = df['Close'].ewm(span=20).mean()
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['EMA20'],
+            line=dict(color='blue', width=2),
+            name='EMA 20'
+        ), row=row, col=1)
+    
+    # MACD
+    if show_macd and 'MACD' in df.columns:
+        # MACD line
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['MACD'],
+            line=dict(color='blue', width=2),
+            name='MACD'
+        ), row=2, col=1)
+        
+        # Signal line
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['MACD_signal'],
+            line=dict(color='red', width=1.5),
+            name='Signal'
+        ), row=2, col=1)
+        
+        # Histogramme
+        colors_histogram = ['green' if x >= 0 else 'red' for x in df['MACD_histogram']]
+        fig.add_trace(go.Bar(
+            x=df.index, y=df['MACD_histogram'],
+            marker_color=colors_histogram,
+            name='Histogram',
+            opacity=0.6
+        ), row=2, col=1)
+        
+        # Ligne zéro
+        fig.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+    
+    fig.update_layout(
+        height=700,
+        template='plotly_white',
+        xaxis_rangeslider_visible=False,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    if show_macd:
+        fig.update_yaxes(title_text="Prix", row=1, col=1)
+        fig.update_yaxes(title_text="MACD", row=2, col=1)
+    else:
+        fig.update_yaxes(title_text="Prix", row=1, col=1)
+    
+    return fig
+
+def create_linebreak_chart(df, bricks, title):
+    """Graphique LineBreak avec dates"""
+    if not bricks or len(bricks) < 2:
+        return None
+    
+    # Prendre les 8-10 dernières briques (comme Boursorama)
+    display_bricks = bricks[-10:] if len(bricks) > 10 else bricks
+    
+    fig = go.Figure()
+    
+    # Récupérer les dates correspondantes aux briques
+    dates = [df.index[brick['index']] for brick in display_bricks]
+    
+    for i, (brick, date) in enumerate(zip(display_bricks, dates)):
+        color = '#00CC00' if brick['type'] == 'green' else '#FF0000'
+        border_color = '#009900' if brick['type'] == 'green' else '#CC0000'
+        
+        # Rectangle de la brique
+        low = min(brick['open'], brick['close'])
+        high = max(brick['open'], brick['close'])
+        
+        fig.add_trace(go.Scatter(
+            x=[i-0.4, i+0.4, i+0.4, i-0.4, i-0.4],
+            y=[low, low, high, high, low],
+            fill="toself",
+            fillcolor=color,
+            line=dict(color=border_color, width=2),
+            mode='lines',
+            showlegend=False,
+            name=f"Brique {i+1}",
+            hovertemplate=f"Date: {date.strftime('%d/%m/%Y')}<br>" +
+                         f"Type: {brick['type']}<br>" +
+                         f"Open: {brick['open']:.2f}<br>" +
+                         f"Close: {brick['close']:.2f}<br>" +
+                         f"<extra></extra>"
+        ))
+        
+        # Ligne médiane (caractéristique Boursorama)
+        fig.add_trace(go.Scatter(
+            x=[i-0.4, i+0.4],
+            y=[brick['open'], brick['open']],
+            line=dict(color='white', width=1.5),
+            mode='lines',
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+    
+    # Annotation pour les 2 dernières briques (signal)
+    if len(display_bricks) >= 2:
+        last_two = display_bricks[-2:]
+        if (last_two[0]['type'] == 'red' and last_two[1]['type'] == 'green'):
+            signal_text = "🔴 → 🟢 ROUGE → VERT"
+            signal_color = "#00CC00"
+        elif (last_two[0]['type'] == 'green' and last_two[1]['type'] == 'red'):
+            signal_text = "🟢 → 🔴 VERT → ROUGE"
+            signal_color = "#FF0000"
+        else:
+            signal_text = None
+        
+        if signal_text:
+            fig.add_annotation(
+                x=len(display_bricks)-1,
+                y=display_bricks[-1]['close'] * 1.02,
+                text=signal_text,
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor=signal_color,
+                font=dict(size=14, color=signal_color, family="Arial Black"),
+                bgcolor="#F8F9FA",
+                bordercolor=signal_color
+            )
+    
+    # Configurer l'axe des x avec les dates
+    fig.update_layout(
+        title=dict(text=f"<b>{title}</b>", x=0.5, font=dict(size=16)),
+        height=500,
+        template='plotly_white',
+        xaxis=dict(
+            tickmode='array',
+            tickvals=list(range(len(dates))),
+            ticktext=[date.strftime('%d/%m') for date in dates],
+            title="Dates (dernières briques à droite)"
+        ),
+        yaxis=dict(title="Prix"),
+        showlegend=False,
+        plot_bgcolor='#F8F9FA'
+    )
+    
+    return fig
+
+# ---------------------------------------------------------------------
+# LISTES DES INDICES
+# ---------------------------------------------------------------------
+
+# CAC40
+CAC40 = [
+    ("AIR.PA","Airbus"), ("AI.PA","Air Liquide"), ("ALO.PA","Alstom"), ("MT.AS","ArcelorMittal"),
+    ("CS.PA","AXA"), ("BNP.PA","BNP Paribas"), ("CAP.PA","Capgemini"), ("CA.PA","Carrefour"),
+    ("ACA.PA","Crédit Agricole"), ("BN.PA","Danone"), ("DSY.PA","Dassault Systèmes"),
+    ("EL.PA","EssilorLuxottica"), ("RMS.PA","Hermès"), ("KER.PA","Kering"),
+    ("LR.PA","Legrand"), ("MC.PA","LVMH"), ("ORA.PA","Orange"), ("RI.PA","Pernod Ricard"),
+    ("PUB.PA","Publicis"), ("RNO.PA","Renault"), ("GLE.PA","Société Générale"),
+    ("STLA.PA","Stellantis"), ("SU.PA","Schneider Electric"), ("HO.PA","Thales"),
+    ("TTE.PA","TotalEnergies"), ("VIE.PA","Veolia"), ("VIV.PA","Vivendi"),
+    ("STM.PA","STMicroelectronics"), ("SGO.PA","Saint-Gobain"), ("DG.PA","Vinci"),
+]
+
+# SBF 120 (CAC40 + 80 autres valeurs)
+SBF120 = CAC40 + [
+    ("AC.PA", "Accor"), ("AF.PA", "Air France-KLM"), ("ATO.PA", "Atos"), 
+    ("EN.PA", "Bouygues"), ("BVI.PA", "Bureau Veritas"), ("CO.PA", "Casino Guichard"),
+    ("CNP.PA", "CNP Assurances"), ("EDEN.PA", "Edenred"), ("EDF.PA", "EDF"),
+    ("EI.PA", "EssilorLuxottica"), ("ERF.PA", "Eurofins Scientific"), ("FR.PA", "Valeo"),
+    ("FGR.PA", "Eiffage"), ("ICAD.PA", "Icade"), ("ITP.PA", "Interparfums"),
+    ("LI.PA", "Klepierre"), ("OR.PA", "L'Oréal"), ("MMB.PA", "Lagardère"),
+    ("LG.PA", "LafargeHolcim"), ("MB.PA", "Michelin"), ("NEX.PA", "Nexans"),
+    ("NK.PA", "Imerys"), ("RI.PA", "Pernod Ricard"), ("UG.PA", "Peugeot"),
+    ("RNO.PA", "Renault"), ("SAF.PA", "Safran"), ("SAN.PA", "Sanofi"),
+    ("SK.PA", "SEB"), ("GLE.PA", "Société Générale"), ("SOI.PA", "Soitec"),
+    ("TEP.PA", "Teleperformance"), ("TFI.PA", "TF1"), ("FR.PA", "Valéo"),
+    ("VK.PA", "Vallourec"), ("VIE.PA", "Veolia"), ("VIV.PA", "Vivendi"),
+    ("MF.PA", "Wendel"), ("XR.PA", "Rexel"), ("RX.PA", "Rexel")
+]
+
+# Dow Jones (30 grandes entreprises américaines)
+DOW_JONES = [
+    ("AAPL", "Apple Inc."), ("MSFT", "Microsoft Corp."), ("AMZN", "Amazon.com Inc."),
+    ("GOOGL", "Alphabet Inc."), ("META", "Meta Platforms Inc."), ("TSLA", "Tesla Inc."),
+    ("BRK-B", "Berkshire Hathaway"), ("JNJ", "Johnson & Johnson"), ("V", "Visa Inc."),
+    ("JPM", "JPMorgan Chase & Co."), ("WMT", "Walmart Inc."), ("PG", "Procter & Gamble"),
+    ("UNH", "UnitedHealth Group"), ("DIS", "Walt Disney Co."), ("NVDA", "NVIDIA Corp."),
+    ("HD", "Home Depot Inc."), ("PYPL", "PayPal Holdings"), ("NFLX", "Netflix Inc."),
+    ("ADBE", "Adobe Inc."), ("CRM", "Salesforce.com"), ("INTC", "Intel Corp."),
+    ("CSCO", "Cisco Systems"), ("PFE", "Pfizer Inc."), ("ABT", "Abbott Laboratories"),
+    ("T", "AT&T Inc."), ("VZ", "Verizon Communications"), ("KO", "Coca-Cola Co."),
+    ("PEP", "PepsiCo Inc."), ("XOM", "Exxon Mobil Corp."), ("CVX", "Chevron Corp.")
+]
+
+# Dictionnaire des indices
+INDICES = {
+    "CAC40": CAC40,
+    "SBF120": SBF120, 
+    "Dow Jones": DOW_JONES
+}
+
+# ---------------------------------------------------------------------
+# SYSTÈME DE FAVORIS AMÉLIORÉ
+# ---------------------------------------------------------------------
+def init_favoris():
+    """Initialise la liste des favoris dans le session state"""
+    if 'favoris' not in st.session_state:
+        st.session_state.favoris = []
+    if 'last_analyzed' not in st.session_state:
+        st.session_state.last_analyzed = None
+
+def toggle_favori(symbol, name):
+    """Ajoute ou retire un favori"""
+    init_favoris()
+    favori_item = (symbol, name)
+    
+    if favori_item in st.session_state.favoris:
+        st.session_state.favoris.remove(favori_item)
+        st.success(f"❌ {name} retiré des favoris")
+    else:
+        st.session_state.favoris.append(favori_item)
+        st.success(f"⭐ {name} ajouté aux favoris")
+    
+    # Forcer le rerun pour mettre à jour l'interface
+    st.rerun()
+
+# ---------------------------------------------------------------------
+# SCANNER TRADING (TOUS LES INDICES)
+# ---------------------------------------------------------------------
+def run_scanner():
+    st.markdown("### 🔍 Scanner Trading")
+    
+    # Initialisation du session state
+    if 'scan_results' not in st.session_state:
+        st.session_state.scan_results = None
+    if 'scan_done' not in st.session_state:
+        st.session_state.scan_done = False
+    if 'selected_index' not in st.session_state:
+        st.session_state.selected_index = "CAC40"
+    
+    st.info("""
+    **🎯 Règle LineBreak :** Détection des actions où les **2 dernières briques LineBreak alternent** 
+    - 🔴 → 🟢 **ROUGE puis VERT** = Tendance haussière
+    - 🟢 → 🔴 **VERT puis ROUGE** = Tendance baissière
+    - **Période :** 3 mois • **Reversal :** 2 briques
+    """)
+    
+    # Options indicateurs seulement
+    st.sidebar.markdown("### 📊 Options indicateurs")
+    show_bollinger = st.sidebar.checkbox("Bandes de Bollinger", value=True)
+    show_ema = st.sidebar.checkbox("EMA 20 (courbe de tendance)", value=True)
+    show_macd = st.sidebar.checkbox("MACD", value=True)
+    auto_display = st.sidebar.checkbox("Afficher graphiques auto", value=False)
+    
+    # Sélection de l'indice dans la sidebar
+    st.sidebar.markdown("### 📈 Indice à scanner")
+    selected_index = st.sidebar.selectbox(
+        "Choisir l'indice:",
+        list(INDICES.keys()),
+        key="index_selector"
+    )
+    
+    # Bouton de scan dans la sidebar
+    if st.sidebar.button("🚀 Lancer le scan", key="scan_trading") or not st.session_state.scan_done:
+        st.session_state.selected_index = selected_index
+        perform_scan(selected_index)
+    
+    # Afficher les résultats si disponibles
+    if st.session_state.scan_results is not None:
+        display_scan_results(st.session_state.scan_results, show_bollinger, show_ema, show_macd, auto_display, selected_index)
+
+def perform_scan(selected_index):
+    """Effectue le scan et stocke les résultats"""
+    stocks_list = INDICES[selected_index]
+    hits = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, (symbol, name) in enumerate(stocks_list):
+        status_text.text(f"🔍 Analyse de {name}...")
+        progress_bar.progress((i + 1) / len(stocks_list))
+        
+        try:
+            # Période FIXE 3mo pour LineBreak
+            df = get_clean_data(symbol, "3mo")
+            if df is not None and len(df) > 20:
+                signal_detected, bricks = detect_boursorama_signal(df)
+                if signal_detected:
+                    hits.append((symbol, name, df, bricks))
+        except Exception as e:
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Stocker les résultats dans session state
+    st.session_state.scan_results = hits
+    st.session_state.scan_done = True
+
+def display_scan_results(hits, show_bollinger, show_ema, show_macd, auto_display, selected_index):
+    """Affiche les résultats du scan avec interactivité"""
+    if hits:
+        st.success(f"**{len(hits)} signal(s) détecté(s) dans le {selected_index}**")
+        
+        for symbol, name, df, bricks in hits:
+            # Déterminer le type de signal
+            last_two = bricks[-2:]
+            if last_two and last_two[0]['type'] == 'red' and last_two[1]['type'] == 'green':
+                signal_type = "🔴 → 🟢 ROUGE → VERT"
+                signal_emoji = "🔴🟢"
+                signal_direction = "HAUSSE"
+            else:
+                signal_type = "🟢 → 🔴 VERT → ROUGE" 
+                signal_emoji = "🟢🔴"
+                signal_direction = "BAISSE"
+            
+            with st.expander(f"{signal_emoji} {name} ({symbol}) - {signal_type} - {signal_direction}", expanded=auto_display):
+                
+                # Bouton favori
+                col_btn1, col_btn2 = st.columns([1, 4])
+                with col_btn1:
+                    is_favori = (symbol, name) in st.session_state.get('favoris', [])
+                    favori_text = "❌ Retirer des favoris" if is_favori else "⭐ Ajouter aux favoris"
+                    if st.button(favori_text, key=f"fav_{symbol}"):
+                        toggle_favori(symbol, name)
+                
+                # Métriques avec vérification de l'actualisation
+                current_price = df['Close'].iloc[-1]
+                prev_price = df['Close'].iloc[-2] if len(df) > 1 else current_price
+                change = current_price - prev_price
+                change_pct = (change / prev_price) * 100
+                
+                # Vérifier si les données sont à jour
+                last_data_date = df.index[-1].date()
+                today = datetime.now().date()
+                is_up_to_date = (today - last_data_date).days <= 1
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Prix", f"{current_price:.2f}", f"{change_pct:+.2f}%")
+                col2.metric("Variation", f"{change:+.2f}")
+                
+                # Afficher la date avec un indicateur d'actualisation
+                date_display = df.index[-1].strftime("%d/%m/%Y")
+                if not is_up_to_date:
+                    date_display += " ⚠️"
+                col3.metric("Dernière MAJ", date_display)
+                
+                col4.metric("Signal", signal_direction)
+                
+                if not is_up_to_date:
+                    st.warning(f"⚠️ Les données de {name} ne sont pas à jour. Dernière date: {df.index[-1].strftime('%d/%m/%Y')}")
+                
+                # Graphiques avec option de période pour le graphique complet seulement
+                st.markdown("#### 📊 Graphiques")
+                
+                # Sélecteur de période pour le graphique complet avec interactivité
+                chart_period = st.selectbox(
+                    f"Période pour {name}",
+                    ["1mo", "3mo", "6mo", "1y"],
+                    index=1,
+                    key=f"chart_period_{symbol}"
+                )
+                
+                # Récupérer données pour la période choisie
+                df_chart = get_clean_data(symbol, chart_period)
+                
+                tab1, tab2 = st.tabs(["📈 Graphique Complet", "🧱 LineBreak (3 mois)"])
+                
+                with tab1:
+                    if df_chart is not None:
+                        st.plotly_chart(
+                            create_pro_chart(df_chart, f"{name} ({symbol}) - {chart_period}", show_bollinger, show_ema, show_macd),
+                            use_container_width=True,
+                            key=f"chart_{symbol}_{chart_period}"
+                        )
+                    else:
+                        st.error("Données non disponibles pour cette période")
+                
+                with tab2:
+                    lb_chart = create_linebreak_chart(df, bricks, f"{name} - LineBreak (3 mois)")
+                    if lb_chart:
+                        st.plotly_chart(lb_chart, use_container_width=True, key=f"lb_{symbol}")
+                    else:
+                        st.warning("Données LineBreak insuffisantes")
+    
+    else:
+        st.info(f"🤖 Aucune alternance détectée dans le {selected_index} pour le moment.")
+        st.caption("💡 _Les signaux LineBreak sont rares - c'est normal d'en avoir peu_")
+
+# ---------------------------------------------------------------------
+# SCANNER FAVORIS COMPLET AVEC SCAN
+# ---------------------------------------------------------------------
+def run_favoris():
+    st.markdown("### ⭐ Scanner Favoris")
+    
+    init_favoris()
+    
+    if not st.session_state.favoris:
+        st.info("🌟 Aucun favori ajouté. Utilisez le scanner Trading pour ajouter des actions à vos favoris.")
+        return
+    
+    st.info(f"**📊 {len(st.session_state.favoris)} action(s) dans les favoris**")
+    
+    # Options indicateurs
+    st.sidebar.markdown("### 📊 Options indicateurs")
+    show_bollinger = st.sidebar.checkbox("Bandes de Bollinger", value=True, key="boll_fav")
+    show_ema = st.sidebar.checkbox("EMA 20 (courbe de tendance)", value=True, key="ema_fav")
+    show_macd = st.sidebar.checkbox("MACD", value=True, key="macd_fav")
+    auto_display_fav = st.sidebar.checkbox("Afficher graphiques auto", value=False, key="auto_fav")
+    
+    # BOUTON DE SCAN DANS LA SIDEBAR POUR LES FAVORIS
+    if st.sidebar.button("🚀 Scanner les favoris", key="scan_favoris"):
+        st.session_state.favoris_mode = "scan"
+        st.rerun()
+    
+    # CHOIX DU MODE : Scan des signaux ou Tous les favoris
+    mode_favoris = st.radio(
+        "Mode d'affichage:",
+        ["🔍 Scanner les favoris", "⭐ Tous mes favoris"],
+        horizontal=True,
+        key="mode_favoris"
+    )
+    
+    if mode_favoris == "🔍 Scanner les favoris":
+        # Scanner des favoris avec détection de signaux
+        scan_favoris(show_bollinger, show_ema, show_macd, auto_display_fav)
+    else:
+        # Affichage de tous les favoris
+        display_all_favoris(show_bollinger, show_ema, show_macd, auto_display_fav)
+
+def scan_favoris(show_bollinger, show_ema, show_macd, auto_display):
+    """Scan des favoris pour détecter les signaux LineBreak"""
+    if not st.session_state.favoris:
+        return
+    
+    # Scanner les favoris pour trouver les signaux
+    hits = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, (symbol, name) in enumerate(st.session_state.favoris):
+        status_text.text(f"🔍 Scan de {name}...")
+        progress_bar.progress((i + 1) / len(st.session_state.favoris))
+        
+        try:
+            # Période FIXE 3mo pour LineBreak
+            df = get_clean_data(symbol, "3mo")
+            if df is not None and len(df) > 20:
+                signal_detected, bricks = detect_boursorama_signal(df)
+                if signal_detected:
+                    hits.append((symbol, name, df, bricks))
+        except Exception as e:
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if hits:
+        st.success(f"**🎯 {len(hits)} signal(s) détecté(s) parmi vos favoris**")
+        
+        for symbol, name, df, bricks in hits:
+            # Déterminer le type de signal
+            last_two = bricks[-2:]
+            if last_two and last_two[0]['type'] == 'red' and last_two[1]['type'] == 'green':
+                signal_type = "🔴 → 🟢 ROUGE → VERT"
+                signal_emoji = "🔴🟢"
+                signal_direction = "HAUSSE"
+            else:
+                signal_type = "🟢 → 🔴 VERT → ROUGE" 
+                signal_emoji = "🟢🔴"
+                signal_direction = "BAISSE"
+            
+            with st.expander(f"{signal_emoji} {name} ({symbol}) - {signal_type} - {signal_direction}", expanded=auto_display):
+                
+                # Bouton retirer favori
+                if st.button("❌ Retirer des favoris", key=f"remove_fav_{symbol}"):
+                    toggle_favori(symbol, name)
+                
+                # Métriques avec vérification de l'actualisation
+                current_price = df['Close'].iloc[-1]
+                prev_price = df['Close'].iloc[-2] if len(df) > 1 else current_price
+                change = current_price - prev_price
+                change_pct = (change / prev_price) * 100
+                
+                # Vérifier si les données sont à jour
+                last_data_date = df.index[-1].date()
+                today = datetime.now().date()
+                is_up_to_date = (today - last_data_date).days <= 1
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Prix", f"{current_price:.2f}", f"{change_pct:+.2f}%")
+                col2.metric("Variation", f"{change:+.2f}")
+                
+                # Afficher la date avec un indicateur d'actualisation
+                date_display = df.index[-1].strftime("%d/%m/%Y")
+                if not is_up_to_date:
+                    date_display += " ⚠️"
+                col3.metric("Dernière MAJ", date_display)
+                
+                col4.metric("Signal", signal_direction)
+                
+                if not is_up_to_date:
+                    st.warning(f"⚠️ Les données de {name} ne sont pas à jour. Dernière date: {df.index[-1].strftime('%d/%m/%Y')}")
+                
+                # Graphiques avec option de période
+                st.markdown("#### 📊 Graphiques")
+                
+                # Sélecteur de période pour le graphique complet
+                chart_period = st.selectbox(
+                    f"Période pour {name}",
+                    ["1mo", "3mo", "6mo", "1y"],
+                    index=1,
+                    key=f"scan_period_{symbol}"
+                )
+                
+                # Récupérer données pour la période choisie
+                df_chart = get_clean_data(symbol, chart_period)
+                
+                tab1, tab2 = st.tabs(["📈 Graphique Complet", "🧱 LineBreak (3 mois)"])
+                
+                with tab1:
+                    if df_chart is not None:
+                        st.plotly_chart(
+                            create_pro_chart(df_chart, f"{name} ({symbol}) - {chart_period}", show_bollinger, show_ema, show_macd),
+                            use_container_width=True,
+                            key=f"scan_chart_{symbol}_{chart_period}"
+                        )
+                    else:
+                        st.error("Données non disponibles pour cette période")
+                
+                with tab2:
+                    if bricks:
+                        lb_chart = create_linebreak_chart(df, bricks, f"{name} - LineBreak (3 mois)")
+                        if lb_chart:
+                            st.plotly_chart(lb_chart, use_container_width=True, key=f"scan_lb_{symbol}")
+                        else:
+                            st.warning("Données LineBreak insuffisantes")
+                    else:
+                        st.info("Aucune brique LineBreak disponible")
+    
+    else:
+        st.info("🤖 Aucun signal détecté parmi vos favoris pour le moment.")
+        st.caption("💡 _Les signaux LineBreak sont rares - surveillez régulièrement vos favoris_")
+
+def display_all_favoris(show_bollinger, show_ema, show_macd, auto_display):
+    """Affiche tous les favoris avec leurs graphiques complets"""
+    if not st.session_state.favoris:
+        return
+    
+    # Analyser tous les favoris
+    favoris_data = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, (symbol, name) in enumerate(st.session_state.favoris):
+        status_text.text(f"📊 Chargement de {name}...")
+        progress_bar.progress((i + 1) / len(st.session_state.favoris))
+        
+        try:
+            # Période FIXE 3mo pour LineBreak
+            df = get_clean_data(symbol, "3mo")
+            if df is not None and len(df) > 20:
+                signal_detected, bricks = detect_boursorama_signal(df)
+                favoris_data.append((symbol, name, df, bricks, signal_detected))
+        except Exception as e:
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Afficher tous les favoris
+    for symbol, name, df, bricks, signal_detected in favoris_data:
+        # Déterminer le type de signal
+        if signal_detected and bricks and len(bricks) >= 2:
+            last_two = bricks[-2:]
+            if last_two[0]['type'] == 'red' and last_two[1]['type'] == 'green':
+                signal_type = "🔴 → 🟢 ROUGE → VERT"
+                signal_emoji = "🔴🟢"
+                signal_direction = "HAUSSE"
+            else:
+                signal_type = "🟢 → 🔴 VERT → ROUGE" 
+                signal_emoji = "🟢🔴"
+                signal_direction = "BAISSE"
+        else:
+            signal_type = "Aucun signal"
+            signal_emoji = "⚪"
+            signal_direction = "NEUTRE"
+        
+        with st.expander(f"{signal_emoji} {name} ({symbol}) - {signal_type} - {signal_direction}", expanded=auto_display):
+            
+            # Bouton retirer favori
+            if st.button("❌ Retirer des favoris", key=f"remove_fav_{symbol}"):
+                toggle_favori(symbol, name)
+            
+            # Métriques avec vérification de l'actualisation
+            current_price = df['Close'].iloc[-1]
+            prev_price = df['Close'].iloc[-2] if len(df) > 1 else current_price
+            change = current_price - prev_price
+            change_pct = (change / prev_price) * 100
+            
+            # Vérifier si les données sont à jour
+            last_data_date = df.index[-1].date()
+            today = datetime.now().date()
+            is_up_to_date = (today - last_data_date).days <= 1
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Prix", f"{current_price:.2f}", f"{change_pct:+.2f}%")
+            col2.metric("Variation", f"{change:+.2f}")
+            
+            # Afficher la date avec un indicateur d'actualisation
+            date_display = df.index[-1].strftime("%d/%m/%Y")
+            if not is_up_to_date:
+                date_display += " ⚠️"
+            col3.metric("Dernière MAJ", date_display)
+            
+            col4.metric("Signal", signal_direction)
+            
+            if not is_up_to_date:
+                st.warning(f"⚠️ Les données de {name} ne sont pas à jour. Dernière date: {df.index[-1].strftime('%d/%m/%Y')}")
+            
+            # Graphiques avec option de période
+            st.markdown("#### 📊 Graphiques")
+            
+            # Sélecteur de période pour le graphique complet
+            chart_period = st.selectbox(
+                f"Période pour {name}",
+                ["1mo", "3mo", "6mo", "1y"],
+                index=1,
+                key=f"fav_period_{symbol}"
+            )
+            
+            # Récupérer données pour la période choisie
+            df_chart = get_clean_data(symbol, chart_period)
+            
+            tab1, tab2 = st.tabs(["📈 Graphique Complet", "🧱 LineBreak (3 mois)"])
+            
+            with tab1:
+                if df_chart is not None:
+                    st.plotly_chart(
+                        create_pro_chart(df_chart, f"{name} ({symbol}) - {chart_period}", show_bollinger, show_ema, show_macd),
+                        use_container_width=True,
+                        key=f"fav_chart_{symbol}_{chart_period}"
+                    )
+                else:
+                    st.error("Données non disponibles pour cette période")
+            
+            with tab2:
+                if bricks:
+                    lb_chart = create_linebreak_chart(df, bricks, f"{name} - LineBreak (3 mois)")
+                    if lb_chart:
+                        st.plotly_chart(lb_chart, use_container_width=True, key=f"fav_lb_{symbol}")
+                    else:
+                        st.warning("Données LineBreak insuffisantes")
+                else:
+                    st.info("Aucune brique LineBreak disponible")
+
+# ---------------------------------------------------------------------
+# ANALYSE INDIVIDUELLE AMÉLIORÉE (TOUTES LES ACTIONS)
+# ---------------------------------------------------------------------
+def run_individual_analysis():
+    st.markdown("### 🔍 Analyse Individuelle")
+    
+    # Mode de sélection : liste prédéfinie OU saisie libre
+    selection_mode = st.radio(
+        "Mode de sélection:",
+        ["📋 Liste prédéfinie", "🔍 Recherche libre"],
+        horizontal=True,
+        key="selection_mode"
+    )
+    
+    if selection_mode == "📋 Liste prédéfinie":
+        # Combiner toutes les actions de tous les indices
+        all_stocks = []
+        for index_name, stocks in INDICES.items():
+            for symbol, name in stocks:
+                all_stocks.append((symbol, name, index_name))
+        
+        # Stocker l'action sélectionnée dans le session state
+        if 'selected_stock' not in st.session_state:
+            st.session_state.selected_stock = f"{all_stocks[0][1]} ({all_stocks[0][0]}) - {all_stocks[0][2]}"
+        
+        selected_stock = st.selectbox(
+            "Choisir une action:",
+            [f"{name} ({symbol}) - {index_name}" for symbol, name, index_name in all_stocks],
+            index=0,
+            key="stock_selector"
+        )
+        
+        # Extraire le symbole et le nom
+        symbol = selected_stock.split("(")[1].split(")")[0]
+        name = selected_stock.split("(")[0].strip()
+        
+    else:  # Mode recherche libre
+        st.info("💡 **Recherche libre** : Entrez n'importe quel symbole Yahoo Finance (ex: AIR.PA, AAPL, MSFT, CAP.PA, etc.)")
+        
+        # Exemples de symboles
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("AIR.PA (Airbus)", use_container_width=True):
+                st.session_state.custom_symbol = "AIR.PA"
+        with col2:
+            if st.button("AAPL (Apple)", use_container_width=True):
+                st.session_state.custom_symbol = "AAPL"
+        with col3:
+            if st.button("CAP.PA (Capgemini)", use_container_width=True):
+                st.session_state.custom_symbol = "CAP.PA"
+        
+        # Champ de saisie libre
+        custom_symbol = st.text_input(
+            "Symbole Yahoo Finance:",
+            value=st.session_state.get('custom_symbol', 'AIR.PA'),
+            placeholder="Ex: AIR.PA, AAPL, MSFT, BNP.PA...",
+            key="custom_symbol_input"
+        )
+        
+        if custom_symbol:
+            symbol = custom_symbol.upper().strip()
+            name = symbol  # Par défaut, utiliser le symbole comme nom
+            
+            # Essayer de récupérer le nom complet via yfinance
+            try:
+                ticker_info = yf.Ticker(symbol).info
+                if 'longName' in ticker_info and ticker_info['longName']:
+                    name = ticker_info['longName']
+                elif 'shortName' in ticker_info and ticker_info['shortName']:
+                    name = ticker_info['shortName']
+            except:
+                pass  # Garder le symbole comme nom si échec
+        else:
+            st.warning("Veuillez entrer un symbole Yahoo Finance")
+            return
+    
+    # Stocker la dernière action analysée
+    st.session_state.last_analyzed = (symbol, name)
+    
+    # Options indicateurs
+    st.sidebar.markdown("### 📊 Options indicateurs")
+    show_bollinger = st.sidebar.checkbox("Bandes de Bollinger", value=True, key="boll_indiv")
+    show_ema = st.sidebar.checkbox("EMA 20 (courbe de tendance)", value=True, key="ema_indiv") 
+    show_macd = st.sidebar.checkbox("MACD", value=True, key="macd_indiv")
+    
+    # Sélecteur de période pour l'analyse individuelle
+    st.sidebar.markdown("### ⏰ Période graphique")
+    chart_period = st.sidebar.selectbox(
+        "Période affichage",
+        ["1mo", "3mo", "6mo", "1y"],
+        index=1,
+        key="period_indiv"
+    )
+    
+    # Bouton d'analyse - toujours afficher l'analyse, pas besoin de bouton
+    # Données pour LineBreak (3mo FIXE)
+    df_lb = get_clean_data(symbol, "3mo")
+    # Données pour graphique complet (période choisie)
+    df_chart = get_clean_data(symbol, chart_period)
+    
+    if df_lb is None or df_lb.empty:
+        st.error(f"❌ Données non disponibles pour {symbol}")
+        st.info("💡 Vérifiez que le symbole est correct et existe sur Yahoo Finance")
+        return
+    
+    signal_detected, bricks = detect_boursorama_signal(df_lb)
+    
+    # Bouton favori - AMÉLIORÉ
+    is_favori = (symbol, name) in st.session_state.get('favoris', [])
+    favori_text = "❌ Retirer des favoris" if is_favori else "⭐ Ajouter aux favoris"
+    fav_col1, fav_col2 = st.columns([1, 5])
+    with fav_col1:
+        if st.button(favori_text, key=f"fav_indiv_{symbol}", type="primary" if not is_favori else "secondary"):
+            toggle_favori(symbol, name)
+    
+    # Métriques avec vérification de l'actualisation
+    current_price = df_lb['Close'].iloc[-1]
+    prev_price = df_lb['Close'].iloc[-2] if len(df_lb) > 1 else current_price
+    change = current_price - prev_price
+    change_pct = (change / prev_price) * 100
+    
+    # Vérifier si les données sont à jour
+    last_data_date = df_lb.index[-1].date()
+    today = datetime.now().date()
+    is_up_to_date = (today - last_data_date).days <= 1
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Prix", f"{current_price:.2f}", f"{change_pct:+.2f}%")
+    col2.metric("Variation", f"{change:+.2f}")
+    
+    # Afficher la date avec un indicateur d'actualisation
+    date_display = df_lb.index[-1].strftime("%d/%m/%Y")
+    if not is_up_to_date:
+        date_display += " ⚠️"
+    col3.metric("Dernière MAJ", date_display)
+    
+    if signal_detected and bricks and len(bricks) >= 2:
+        last_two = bricks[-2:]
+        if last_two[0]['type'] == 'red' and last_two[1]['type'] == 'green':
+            signal_type = "🔴 → 🟢 ROUGE → VERT"
+            signal_direction = "HAUSSE"
+        else:
+            signal_type = "🟢 → 🔴 VERT → ROUGE"
+            signal_direction = "BAISSE"
+        col4.metric("Signal", signal_direction)
+        st.success(f"🎯 **{signal_type} détecté !** - Signal {signal_direction}")
+    else:
+        col4.metric("Signal", "Aucun")
+        st.info("🤖 Aucune alternance détectée")
+    
+    if not is_up_to_date:
+        st.warning(f"⚠️ Les données de {name} ne sont pas à jour. Dernière date: {df_lb.index[-1].strftime('%d/%m/%Y')}")
+        st.info("💡 Utilisez le bouton 'Actualiser toutes les données' dans la sidebar pour forcer l'actualisation")
+    
+    # Graphiques
+    tab1, tab2 = st.tabs(["📈 Graphique Complet", "🧱 LineBreak (3 mois)"])
+    
+    with tab1:
+        if df_chart is not None and not df_chart.empty:
+            st.plotly_chart(
+                create_pro_chart(df_chart, f"{name} ({symbol}) - {chart_period}", show_bollinger, show_ema, show_macd),
+                use_container_width=True,
+                key=f"indiv_chart_{symbol}_{chart_period}"
+            )
+        else:
+            st.error("Données non disponibles pour cette période")
+    
+    with tab2:
+        if bricks:
+            lb_chart = create_linebreak_chart(df_lb, bricks, f"{name} - LineBreak (3 mois)")
+            if lb_chart:
+                st.plotly_chart(lb_chart, use_container_width=True, key=f"indiv_lb_{symbol}")
+            else:
+                st.warning("Données LineBreak insuffisantes")
+        else:
+            st.info("Aucune brique LineBreak disponible")
+
+# ---------------------------------------------------------------------
+# INTERFACE PRINCIPALE
+# ---------------------------------------------------------------------
+def main():
+    st.sidebar.title("Navigation")
+    app_mode = st.sidebar.selectbox(
+        "Choisir le mode:",
+        ["Scanner Trading", "Analyse Individuelle", "⭐ Favoris", "Analyse Technique"]
+    )
+    
+    # Initialisation des favoris
+    init_favoris()
+    
+    # Bouton d'actualisation général dans la sidebar
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🔄 Actualiser toutes les données", type="secondary"):
+        st.cache_data.clear()
+        # Réinitialiser tous les états sauf les favoris et last_analyzed
+        favoris_backup = st.session_state.get('favoris', [])
+        last_analyzed_backup = st.session_state.get('last_analyzed', None)
+        for key in list(st.session_state.keys()):
+            if key not in ['favoris', 'last_analyzed']:
+                del st.session_state[key]
+        st.session_state.favoris = favoris_backup
+        st.session_state.last_analyzed = last_analyzed_backup
+        st.rerun()
+    
+    if app_mode == "Scanner Trading":
+        run_scanner()
+    elif app_mode == "Analyse Individuelle":
+        run_individual_analysis()
+    elif app_mode == "⭐ Favoris":
+        run_favoris()
+    else:
+        st.markdown("""
+        ## 📊 Analyse Technique
+
+        ### 🧱 LineBreak
+        **Règles de trading :**
+        - 🔴 → 🟢 **ROUGE puis VERT** = Tendance haussière
+        - 🟢 → 🔴 **VERT puis ROUGE** = Tendance baissière
+
+        **Combinaison de signaux :**
+        - ✅ **LineBreak rouge→vert** + ✅ **Cours touche bande Bollinger basse** + ➡️ **Courbe tendance neutre/hausse** = 📈 Signal haussier renforcé
+        - ✅ **LineBreak vert→rouge** + ✅ **Cours touche bande Bollinger haute** + ➡️ **Courbe tendance neutre/baisse** = 📉 Signal baissier renforcé
+
+        ### 📈 Indicateurs Techniques Intégrés
+
+        **Bandes de Bollinger**
+        - **Calcul :** Moyenne mobile 20 jours + 2 écarts-types
+        - **Bande supérieure =** SMA20 + (2 × écart-type)
+        - **Bande inférieure =** SMA20 - (2 × écart-type)
+        - **Utilité :** Repérer les niveaux de surachat/survente
+
+        **EMA 20 (courbe de tendance)**
+        - **Calcul :** Moyenne mobile exponentielle sur 20 jours
+        - **Formule :** EMA = (Prix × α) + (EMA_précédent × (1-α)) où α = 2/(20+1)
+        - **Interprétation :** 
+          - Courbe en hausse = tendance haussière
+          - Courbe en baisse = tendance baissière  
+          - Courbe plate = tendance neutre
+
+        **MACD**
+        - **Calcul :** EMA12 - EMA26 (ligne MACD)
+        - **Ligne de signal :** EMA9 du MACD
+        - **Histogramme :** MACD - ligne de signal
+        - **Interprétation :**
+          - Au-dessus de 0 = tendance haussière
+          - En-dessous de 0 = tendance baissière
+          - Ligne MACD croise ligne de signal = changement de momentum
+
+        ### 🔄 Fonctionnalités Interactives
+        - Scan automatique du CAC40, SBF120 et Dow Jones
+        - Système de favoris avec analyse complète
+        - Graphiques interactifs avec dates
+        - Actualisation manuelle des données
+        - Indicateurs personnalisables
+
+        *📈 Données Yahoo Finance • 🎯 Algorithmes professionnels • ⚠️ À titre éducatif uniquement*
+
+        **⚠️ AVERTISSEMENT :** Ce scanner est un outil d'aide à la décision. 
+        Les performances passées ne préjugent pas des performances futures. 
+        Investissez uniquement l'argent que vous pouvez vous permettre de perdre.
+        """)
+
+if __name__ == "__main__":
+    main()
